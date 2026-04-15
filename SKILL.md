@@ -99,15 +99,39 @@ curl https://nvidia-key-proxy-larsondrake.zocomputer.io/v1/models \
 
 ## Streaming Implementation
 
-**Response streaming is enabled** - proxy streams 8KB chunks back to client immediately:
+**Response streaming is enabled** - proxy uses HTTP/2 via `httpx` and streams 4KB chunks back to client immediately:
 
 | Feature | Value |
 |---------|-------|
-| Chunk size | 8KB |
+| HTTP Version | HTTP/2 (via httpx) |
+| Chunk size | 4KB |
 | Timeout | 300 seconds |
 | Disconnect handling | Graceful (logged, not crashed) |
 
-This fixes issues with long responses (coding sessions, tool calls) where buffering caused timeouts. Chunks flow immediately instead of waiting for full response.
+**Why HTTP/2 + Chunked Streaming Matters:**
+1. **Faster** - HTTP/2 multiplexes requests, lower latency
+2. **No buffering** - Chunks flow immediately instead of waiting for full response
+3. **Tool calls work** - Long responses don't timeout mid-stream
+4. **Client disconnect detection** - `BrokenPipeError` caught, logged, doesn't crash
+
+This fixes issues with long responses (coding sessions, tool calls) where Python's `urllib` buffering caused timeouts.
+
+## 429 Key Rotation
+
+**Critical implementation detail:** With `httpx.stream()`, you must check `resp.status_code` BEFORE entering the stream context. `HTTPStatusError` is NOT raised for 429s during streaming.
+
+```python
+# WRONG - 429 won't be caught
+with client.stream(method, url, ...) as resp:
+    for chunk in resp.iter_bytes():  # Already committed to stream
+        ...
+
+# CORRECT - Check status first
+with client.stream(method, url, ...) as resp:
+    if resp.status_code == 429:
+        # Rotate key and retry
+        ...
+```
 
 ## Configuration
 
