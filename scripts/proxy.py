@@ -113,6 +113,33 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             try:
                 # Use streaming request
                 with client.stream(method, url, headers=headers, content=body) as resp:
+                    # CHECK FOR 429 BEFORE STREAMING
+                    if resp.status_code == 429:
+                        print(f"[PROXY] 429 from key {current_idx + 1}", flush=True)
+                        total_429s[0] += 1
+                        
+                        # Read error body for potential retry
+                        resp.read()  # Consume the response
+                        
+                        next_idx = (current_idx + 1) % len(API_KEYS)
+                        
+                        if next_idx in tried_keys:
+                            print(f"[PROXY] All {len(API_KEYS)} keys exhausted, returning 429", flush=True)
+                            self.send_response(429)
+                            self.send_header("Content-Type", "application/json")
+                            self.send_header("Access-Control-Allow-Origin", "*")
+                            self.end_headers()
+                            self.wfile.write(json.dumps({
+                                "error": "All API keys rate limited",
+                                "keys_tried": len(tried_keys)
+                            }).encode())
+                            print(f"[PROXY] ← 429 (all keys exhausted, {int(time.time() * 1000) - start_ms}ms)", flush=True)
+                            return
+                        
+                        # Rotate to next key and retry
+                        current_idx = rotate_key()
+                        continue
+                    
                     # Send response headers
                     self.send_response(resp.status_code)
                     
