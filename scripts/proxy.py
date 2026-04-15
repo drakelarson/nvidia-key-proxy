@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-Nvidia API Key Rotation Proxy
-Hardcoded API keys - cycles through all keys on 429 before giving up.
+Nvidia API Key Rotation Proxy - HTTP/2 Streaming Support
+Uses httpx for HTTP/2 support with proper streaming.
 """
 import http.server
 import socketserver
-import urllib.request
-import urllib.error
 import json
 import threading
 import time
 import sys
+import httpx
 
 # Unbuffered stdout for proper logging
 sys.stdout.reconfigure(line_buffering=True)
@@ -28,11 +27,24 @@ API_KEYS = [
 
 PORT = 3090
 
+# Shared HTTP/2 client (more efficient connection reuse)
+http_client = None
+client_lock = threading.Lock()
+
 key_lock = threading.Lock()
-key_index = [0]  # current key index
+key_index = [0]
 
 total_requests = [0]
 total_429s = [0]
+
+
+def get_client():
+    """Get or create HTTP/2 client"""
+    global http_client
+    with client_lock:
+        if http_client is None:
+            http_client = httpx.Client(http2=True, timeout=300.0, follow_redirects=True)
+        return http_client
 
 
 def get_key_index():
@@ -50,7 +62,7 @@ def rotate_key():
         key_index[0] = (key_index[0] + 1) % len(API_KEYS)
         total_429s[0] += 1
         new_idx = key_index[0]
-    print(f"[PROXY] 429 → rotating to key {new_idx + 1}/{len(API_KEYS)} (total 429s: {total_429s[0]})")
+    print(f"[PROXY] 429 → rotating to key {new_idx + 1}/{len(API_KEYS)} (total 429s: {total_429s[0]})", flush=True)
     return new_idx
 
 
@@ -59,7 +71,7 @@ def build_upstream_headers(req_headers, key):
     for k, v in req_headers.items():
         if k.lower() == "authorization":
             headers[k] = f"Bearer {key}"
-        elif k.lower() not in ("host", "connection"):
+        elif k.lower() not in ("host", "connection", "content-length"):
             headers[k] = v
     return headers
 
@@ -68,7 +80,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
 
     def log_message(self, fmt, *args):
-        print(f"[PROXY] {fmt % args}")
+        print(f"[PROXY] {fmt % args}", flush=True)
 
     def do_OPTIONS(self):
         self.send_response(200)
@@ -86,70 +98,62 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         url = f"{BASE_URL}{self.path}"
 
-        # Track which keys we've tried for this request
         tried_keys = set()
         current_idx = get_key_index()
+        client = get_client()
 
         while True:
             key = API_KEYS[current_idx]
             tried_keys.add(current_idx)
 
-            print(f"[PROXY] {method} {self.path} → key={current_idx + 1}/{len(API_KEYS)}")
+            print(f"[PROXY] {method} {self.path} → key={current_idx + 1}/{len(API_KEYS)} (HTTP/2)", flush=True)
 
             headers = build_upstream_headers(dict(self.headers), key)
-            req = urllib.request.Request(url, data=body, headers=headers, method=method)
 
             try:
-                with urllib.request.urlopen(req, timeout=300) as resp:
-                    # Get headers but don't read body yet
-                    resp_headers = {k: v for k, v in resp.headers.items()}
+                # Use streaming request
+                with client.stream(method, url, headers=headers, content=body) as resp:
+                    # Send response headers
+                    self.send_response(resp.status_code)
                     
-                    # Update global key index on success
-                    set_key_index(current_idx)
-
-                    # Send response headers first
-                    self.send_response(resp.status)
-                    for k, v in resp_headers.items():
-                        if k.lower() not in ("transfer-encoding", "connection", "keep-alive"):
+                    # Forward response headers
+                    for k, v in resp.headers.items():
+                        if k.lower() not in ("transfer-encoding", "connection", "keep-alive", "content-encoding"):
                             self.send_header(k, v)
                     self.send_header("Access-Control-Allow-Origin", "*")
                     self.end_headers()
 
-                    # Stream response body in chunks
+                    # Stream body in chunks
                     total_bytes = 0
                     chunk_count = 0
                     try:
-                        while True:
-                            chunk = resp.read(8192)  # 8KB chunks
-                            if not chunk:
-                                break
-                            self.wfile.write(chunk)
-                            self.wfile.flush()  # Flush each chunk immediately
-                            total_bytes += len(chunk)
-                            chunk_count += 1
+                        for chunk in resp.iter_bytes(chunk_size=4096):  # 4KB chunks for more frequent flushes
+                            if chunk:
+                                self.wfile.write(chunk)
+                                self.wfile.flush()
+                                total_bytes += len(chunk)
+                                chunk_count += 1
                     except (BrokenPipeError, ConnectionResetError) as e:
                         print(f"[PROXY] Client disconnected after {chunk_count} chunks ({total_bytes} bytes): {e}", flush=True)
                         return
 
+                    # Update key index on success
+                    set_key_index(current_idx)
+
                     duration = int(time.time() * 1000) - start_ms
-                    print(f"[PROXY] ← {resp.status} ({duration}ms, {chunk_count} chunks, {total_bytes} bytes)")
+                    print(f"[PROXY] ← {resp.status_code} ({duration}ms, {chunk_count} chunks, {total_bytes} bytes)", flush=True)
                     return
 
-            except urllib.error.HTTPError as e:
-                resp_body = e.read() if e.fp else b""
-                resp_headers = {k: v for k, v in e.headers.items()} if e.headers else {}
-
-                # 429 → try next key (circular)
-                if e.code == 429:
-                    print(f"[PROXY] 429 from key {current_idx + 1}")
+            except httpx.HTTPStatusError as e:
+                # Handle HTTP errors
+                if e.response.status_code == 429:
+                    print(f"[PROXY] 429 from key {current_idx + 1}", flush=True)
                     total_429s[0] += 1
 
-                    # Move to next key (circular)
                     next_idx = (current_idx + 1) % len(API_KEYS)
 
-                    # If we've tried all keys, give up
                     if next_idx in tried_keys:
-                        print(f"[PROXY] All {len(API_KEYS)} keys exhausted, returning 429")
+                        print(f"[PROXY] All {len(API_KEYS)} keys exhausted, returning 429", flush=True)
                         self.send_response(429)
                         self.send_header("Content-Type", "application/json")
                         self.send_header("Access-Control-Allow-Origin", "*")
@@ -158,27 +162,27 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             "error": "All API keys rate limited",
                             "keys_tried": len(tried_keys)
                         }).encode())
-                        print(f"[PROXY] ← 429 (all keys exhausted, {int(time.time() * 1000) - start_ms}ms)")
+                        print(f"[PROXY] ← 429 (all keys exhausted, {int(time.time() * 1000) - start_ms}ms)", flush=True)
                         return
 
-                    # Rotate to next key and retry
                     current_idx = rotate_key()
                     continue
 
-                # Non-429 error → return as-is
-                self.send_response(e.code)
-                for k, v in resp_headers.items():
+                # Non-429 error
+                resp_body = e.response.content
+                self.send_response(e.response.status_code)
+                for k, v in e.response.headers.items():
                     if k.lower() not in ("transfer-encoding", "connection", "keep-alive"):
                         self.send_header(k, v)
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(resp_body)
-                print(f"[PROXY] ← {e.code} ({int(time.time() * 1000) - start_ms}ms)")
+                print(f"[PROXY] ← {e.response.status_code} ({int(time.time() * 1000) - start_ms}ms)", flush=True)
                 return
 
             except Exception as e:
-                print(f"[PROXY] ERROR: {e}")
+                print(f"[PROXY] ERROR: {e}", flush=True)
                 self.send_response(502)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Access-Control-Allow-Origin", "*")
@@ -208,8 +212,8 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 if __name__ == "__main__":
-    print(f"[PROXY] Listening on http://0.0.0.0:{PORT}")
-    print(f"[PROXY] {len(API_KEYS)} API key(s) loaded")
-    print(f"[PROXY] Circular key rotation + streaming enabled")
+    print(f"[PROXY] Listening on http://0.0.0.0:{PORT}", flush=True)
+    print(f"[PROXY] {len(API_KEYS)} API key(s) loaded", flush=True)
+    print(f"[PROXY] HTTP/2 + streaming enabled (httpx)", flush=True)
     with ThreadedHTTPServer(("0.0.0.0", PORT), ProxyHandler) as httpd:
         httpd.serve_forever()
