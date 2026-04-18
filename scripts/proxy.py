@@ -96,25 +96,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length) if content_length > 0 else None
 
-        # Parse body to add model-specific defaults
-        request_body = json.loads(body) if body else {}
-        
-        # Set default max_tokens for models with low defaults (z-ai/glm4.7 defaults to ~32 tokens!)
-        if not request_body.get("max_tokens"):
-            model = request_body.get("model", "")
-            if "z-ai/glm" in model or "glm4" in model or "reasoning" in model:
-                request_body["max_tokens"] = 4096
-                print(f"[PROXY] Added max_tokens=4096 for {model}", flush=True)
-        
-        # For z-ai/glm4.7, ensure chat_template_kwargs is set
-        if request_body.get("model") == "z-ai/glm4.7" and not request_body.get("chat_template_kwargs"):
-            request_body["chat_template_kwargs"] = {
-                "enable_thinking": False,
-                "clear_thinking": True
-            }
-            print(f"[PROXY] Added chat_template_kwargs for z-ai/glm4.7", flush=True)
-        
-        body = json.dumps(request_body).encode() if request_body else body
+        # Parse body and fix max_tokens for z-ai/glm models
+        if body:
+            try:
+                parsed_body = json.loads(body)
+                if not parsed_body.get("max_tokens") and parsed_body.get("model", "").startswith("z-ai/"):
+                    parsed_body["max_tokens"] = 16384
+                    body = json.dumps(parsed_body).encode()
+            except:
+                pass
 
         url = f"{BASE_URL}{self.path}"
 
