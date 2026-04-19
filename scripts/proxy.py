@@ -100,8 +100,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         if body:
             try:
                 parsed_body = json.loads(body)
-                if not parsed_body.get("max_tokens") and parsed_body.get("model", "").startswith("z-ai/"):
-                    parsed_body["max_tokens"] = 16384
+                if not parsed_body.get("max_tokens"):
+                    parsed_body["max_tokens"] = 32768
                     body = json.dumps(parsed_body).encode()
             except:
                 pass
