@@ -102,7 +102,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 parsed_body = json.loads(body)
                 if not parsed_body.get("max_tokens"):
                     parsed_body["max_tokens"] = 32768
-                    body = json.dumps(parsed_body).encode()
+                # Auto-disable thinking for moonshotai/kimi-k2.5 to prevent token budget truncation
+                if parsed_body.get("model") == "moonshotai/kimi-k2.5" and not parsed_body.get("chat_template_kwargs"):
+                    parsed_body["chat_template_kwargs"] = {"thinking": False}
+                    print(f"[PROXY] Auto-disabled thinking for moonshotai/kimi-k2.5", flush=True)
+                body = json.dumps(parsed_body).encode()
             except:
                 pass
 
