@@ -104,8 +104,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     parsed_body["max_tokens"] = 32768
                 
                 # Hardcoded - always override
-                parsed_body["temperature"] = 0.75
-                parsed_body["top_p"] = 1.0
+                parsed_body["temperature"] = 1.0
+                parsed_body["top_p"] = 0.95
                 # Auto-disable thinking for moonshotai/kimi-k2.5 to prevent token budget truncation
                 if parsed_body.get("model") == "moonshotai/kimi-k2.5" and not parsed_body.get("chat_template_kwargs"):
                     parsed_body["chat_template_kwargs"] = {"thinking": False}
